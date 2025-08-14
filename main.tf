@@ -1,5 +1,6 @@
 terraform {
   required_version = ">= 1.6.0"
+
   required_providers {
     aws = {
       source  = "hashicorp/aws"
@@ -12,19 +13,26 @@ provider "aws" {
   region = var.region
 }
 
+# Useful identity/partition/VPC lookups
 data "aws_caller_identity" "current" {}
 data "aws_partition" "current" {}
-data "aws_vpc" "default" { default = true }
+data "aws_vpc" "default" {
+  default = true
+}
 
 # --- IAM role for EC2 (SSM + minimal ECR/EKS) ---
 resource "aws_iam_role" "admin_cli" {
-  name               = "${var.project}-admin-cli-role"
+  name = "${var.project}-admin-cli-role"
+
   assume_role_policy = jsonencode({
     Version = "2012-10-17",
     Statement = [{
       Effect = "Allow",
-      Principal = { Service = "ec2.${data.aws_partition.current.dns_suffix}" },
-      Action   = "sts:AssumeRole"
+      Principal = {
+        # Works across partitions (e.g., aws / aws-cn)
+        Service = "ec2.${data.aws_partition.current.dns_suffix}"
+      },
+      Action = "sts:AssumeRole"
     }]
   })
 }
@@ -35,11 +43,12 @@ resource "aws_iam_role_policy_attachment" "ssm" {
 }
 
 resource "aws_iam_policy" "minimal" {
-  name   = "${var.project}-admin-cli-minimal"
+  name = "${var.project}-admin-cli-minimal"
+
   policy = jsonencode({
     Version = "2012-10-17",
     Statement = [
-      # Read ECR (pull/push images if you choose)
+      # ECR (pull/push images if needed)
       {
         Effect = "Allow",
         Action = [
@@ -56,11 +65,23 @@ resource "aws_iam_policy" "minimal" {
         ],
         Resource = "*"
       },
-      # Describe EKS clusters for kubeconfig generation
-      { Effect = "Allow", Action = ["eks:DescribeCluster"], Resource = "*" },
-      # Optional S3/DynamoDB for TF state if you run TF on the instance later
-      { Effect = "Allow", Action = ["s3:*"], Resource = "*" },
-      { Effect = "Allow", Action = ["dynamodb:*"], Resource = "*" }
+      # EKS describe for kubeconfig generation
+      {
+        Effect   = "Allow",
+        Action   = ["eks:DescribeCluster"],
+        Resource = "*"
+      },
+      # Optional S3/DynamoDB if you ever run TF on the instance
+      {
+        Effect   = "Allow",
+        Action   = ["s3:*"],
+        Resource = "*"
+      },
+      {
+        Effect   = "Allow",
+        Action   = ["dynamodb:*"],
+        Resource = "*"
+      }
     ]
   })
 }
@@ -81,6 +102,7 @@ resource "aws_security_group" "admin_cli" {
   description = "Admin CLI EC2; SSM access only"
   vpc_id      = data.aws_vpc.default.id
 
+  # No inbound rules (SSM uses outbound to reach AWS endpoints)
   egress {
     from_port   = 0
     to_port     = 0
@@ -88,7 +110,9 @@ resource "aws_security_group" "admin_cli" {
     cidr_blocks = ["0.0.0.0/0"]
   }
 
-  tags = { Name = "${var.project}-admin-cli" }
+  tags = {
+    Name = "${var.project}-admin-cli"
+  }
 }
 
 # --- User data / cloud-init ---
@@ -117,7 +141,7 @@ locals {
   curl -L https://github.com/mikefarah/yq/releases/latest/download/yq_linux_amd64 -o /usr/local/bin/yq
   chmod +x /usr/local/bin/yq
 
-  # trivy
+  # trivy (tolerate version mismatches)
   rpm -ivh https://github.com/aquasecurity/trivy/releases/latest/download/trivy_${var.trivy_version}_Linux-64bit.rpm || true
 
   # cosign
@@ -130,18 +154,28 @@ locals {
   export CLUSTER_NAME="${var.cluster_name}"
   SHP
 
-  # Done marker
   echo "bootstrap-complete" > /var/log/secureshop-bootstrap.log
   EOF
 }
 
+# --- Latest Amazon Linux 2023 AMI (x86_64) ---
+data "aws_ami" "al2023" {
+  owners      = ["amazon"]
+  most_recent = true
+
+  filter {
+    name   = "name"
+    values = ["al2023-ami-*-x86_64"]
+  }
+}
+
 # --- EC2 instance ---
 resource "aws_instance" "admin_cli" {
-  ami           = data.aws_ami.al2023.id
-  instance_type = var.instance_type
-  iam_instance_profile = aws_iam_instance_profile.admin_cli.name
+  ami                    = data.aws_ami.al2023.id
+  instance_type          = var.instance_type
+  iam_instance_profile   = aws_iam_instance_profile.admin_cli.name
   vpc_security_group_ids = [aws_security_group.admin_cli.id]
-  user_data     = local.cloud_init
+  user_data              = local.cloud_init
 
   tags = {
     Name    = "${var.project}-admin-cli"
@@ -149,12 +183,15 @@ resource "aws_instance" "admin_cli" {
   }
 }
 
-data "aws_ami" "al2023" {
-  owners      = ["amazon"]
-  most_recent = true
-  filter { name = "name" values = ["al2023-ami-*-x86_64"] }
+# --- Outputs ---
+output "admin_cli_instance_id" {
+  value = aws_instance.admin_cli.id
 }
 
-output "admin_cli_instance_id" { value = aws_instance.admin_cli.id }
-output "admin_cli_public_ip"   { value = aws_instance.admin_cli.public_ip }
-output "admin_cli_role"        { value = aws_iam_role.admin_cli.name }
+output "admin_cli_public_ip" {
+  value = aws_instance.admin_cli.public_ip
+}
+
+output "admin_cli_role" {
+  value = aws_iam_role.admin_cli.name
+}
